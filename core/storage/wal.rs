@@ -2055,6 +2055,9 @@ impl WalCoordination for ShmWalCoordination {
                 read_locks[0].unlock();
                 return None;
             }
+            if !self.publish_shared_reader(read_locks, snapshot, 0) {
+                return None;
+            }
             return Some(ReadGuardKind::DbFile);
         }
 
@@ -2093,18 +2096,9 @@ impl WalCoordination for ShmWalCoordination {
 
         let read_mark_index =
             NonZeroUsize::new(best_idx as usize).expect("best_idx checked to be positive");
-        let reader = self
-            .authority
-            .register_reader_for_snapshot(self.owner, snapshot.max_frame)?;
-        if self.load_snapshot() != snapshot {
-            self.authority.unregister_reader_for_snapshot(reader);
-            read_locks[best_idx as usize].unlock();
+        if !self.publish_shared_reader(read_locks, snapshot, best_idx as usize) {
             return None;
         }
-
-        let mut active_reader = self.active_reader.lock();
-        turso_assert!(active_reader.is_none(), "shared reader registration leaked");
-        *active_reader = Some(reader);
         Some(ReadGuardKind::ReadMark(read_mark_index))
     }
 
@@ -2416,6 +2410,41 @@ impl WalCoordination for ShmWalCoordination {
             SharedWalCoordinationOpenMode::Exclusive => "exclusive",
             SharedWalCoordinationOpenMode::MultiProcess => "multiprocess",
         })
+    }
+}
+
+#[cfg(host_shared_wal)]
+impl ShmWalCoordination {
+    /// Register this connection's snapshot in the shared reader table so a
+    /// checkpoint in another process never backfills frames past it. This
+    /// covers readers that bypass the WAL as well: the local read lock 0 they
+    /// hold is invisible to other processes. The snapshot is checked again
+    /// after the registration because a commit in between could have let a
+    /// checkpoint pick its safe frame before the slot was visible. On failure
+    /// the local read lock at `read_lock_idx` is released and the caller
+    /// retries.
+    fn publish_shared_reader(
+        &self,
+        read_locks: &[TursoRwLock; 5],
+        snapshot: WalSnapshot,
+        read_lock_idx: usize,
+    ) -> bool {
+        let Some(reader) = self
+            .authority
+            .register_reader_for_snapshot(self.owner, snapshot.max_frame)
+        else {
+            read_locks[read_lock_idx].unlock();
+            return false;
+        };
+        if self.load_snapshot() != snapshot {
+            self.authority.unregister_reader_for_snapshot(reader);
+            read_locks[read_lock_idx].unlock();
+            return false;
+        }
+        let mut active_reader = self.active_reader.lock();
+        turso_assert!(active_reader.is_none(), "shared reader registration leaked");
+        *active_reader = Some(reader);
+        true
     }
 }
 
